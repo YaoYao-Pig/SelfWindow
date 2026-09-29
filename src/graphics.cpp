@@ -79,10 +79,11 @@ struct V {float4 position:SV_POSITION;float2 uv:TEXCOORD0;};
 V VS(uint id:SV_VertexID) {
     V v;float2 p=float2((id<<1)&2,id&2);v.uv=p;v.position=float4(p.x*2-1,1-p.y*2,0,1);return v;
 }
+V MeshVS(float2 p:POSITION,float2 uv:TEXCOORD0){V v;v.position=float4(p.x*2-1,1-p.y*2,0,1);v.uv=uv;return v;}
 float4 PS(V v):SV_TARGET {
     float3 p=float3(v.uv,1);float z=dot(r2.xyz,p);
     if(abs(z)<0.000001) return float4(0,0,0,1);
-    float2 uv=float2(dot(r0.xyz,p),dot(r1.xyz,p))/z;
+    float2 uv=options.w>0.5?v.uv:float2(dot(r0.xyz,p),dot(r1.xyz,p))/z;
     if(any(uv<0)||any(uv>1)) return float4(0,0,0,1);
     if(options.x>0.5) {
         float2 px=uv*options.yz;
@@ -120,22 +121,44 @@ Renderer::Renderer(Graphics& g,HWND window,int w,int h):graphics(g),width(w),hei
     compile("VS","vs_5_0",vsBlob);compile("PS","ps_5_0",psBlob);
     check_hresult(g.device->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,vs.put()));
     check_hresult(g.device->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,ps.put()));
+    com_ptr<ID3DBlob> meshBlob;compile("MeshVS","vs_5_0",meshBlob);
+    check_hresult(g.device->CreateVertexShader(meshBlob->GetBufferPointer(),meshBlob->GetBufferSize(),nullptr,meshVs.put()));
+    D3D11_INPUT_ELEMENT_DESC layout[]={{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},{"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,8,D3D11_INPUT_PER_VERTEX_DATA,0}};
+    check_hresult(g.device->CreateInputLayout(layout,2,meshBlob->GetBufferPointer(),meshBlob->GetBufferSize(),meshLayout.put()));
     D3D11_BUFFER_DESC cb{};cb.ByteWidth=64;cb.Usage=D3D11_USAGE_DEFAULT;cb.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
     check_hresult(g.device->CreateBuffer(&cb,nullptr,constants.put()));
     D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
     check_hresult(g.device->CreateSamplerState(&sd,sampler.put()));
 }
 void Renderer::draw(ID3D11ShaderResourceView* source,const Homography& transform,bool grid) {
+    drawFrame(source,transform,grid,false);
+}
+void Renderer::draw(ID3D11ShaderResourceView* source,const WarpMapping& mapping,bool grid){
+    if(mapping.projective){draw(source,mapping.homography,grid);return;}
+    if(meshRevision!=mapping.revision){
+        meshVertices=nullptr;meshIndices=nullptr;
+        D3D11_BUFFER_DESC desc{};desc.Usage=D3D11_USAGE_IMMUTABLE;desc.BindFlags=D3D11_BIND_VERTEX_BUFFER;desc.ByteWidth=static_cast<UINT>(mapping.vertices.size()*sizeof(WarpVertex));
+        D3D11_SUBRESOURCE_DATA data{};data.pSysMem=mapping.vertices.data();check_hresult(graphics.device->CreateBuffer(&desc,&data,meshVertices.put()));
+        desc.BindFlags=D3D11_BIND_INDEX_BUFFER;desc.ByteWidth=static_cast<UINT>(mapping.indices.size()*sizeof(std::uint32_t));data.pSysMem=mapping.indices.data();
+        check_hresult(graphics.device->CreateBuffer(&desc,&data,meshIndices.put()));meshIndexCount=static_cast<UINT>(mapping.indices.size());meshRevision=mapping.revision;
+    }
+    drawFrame(source,Homography{},grid,true);
+}
+void Renderer::drawFrame(ID3D11ShaderResourceView* source,const Homography& transform,bool grid,bool mesh) {
     auto inv=transform.inverse();
     float params[16]{};for(int r=0;r<3;++r)for(int c=0;c<3;++c) params[r*4+c]=static_cast<float>(inv.m[r*3+c]);
     params[12]=grid?1.f:0.f;params[13]=static_cast<float>(width);params[14]=static_cast<float>(height);
+    params[15]=mesh?1.f:0.f;
     auto ctx=graphics.context.get();ctx->UpdateSubresource(constants.get(),0,nullptr,params,0,0);
     auto rt=target.get();ctx->OMSetRenderTargets(1,&rt,nullptr);
+    const float black[]={0,0,0,1};ctx->ClearRenderTargetView(rt,black);
     D3D11_VIEWPORT vp{0,0,static_cast<float>(width),static_cast<float>(height),0,1};ctx->RSSetViewports(1,&vp);
-    ctx->IASetInputLayout(nullptr);ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->VSSetShader(vs.get(),nullptr,0);ctx->PSSetShader(ps.get(),nullptr,0);
+    ctx->IASetInputLayout(mesh?meshLayout.get():nullptr);ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(mesh?meshVs.get():vs.get(),nullptr,0);ctx->PSSetShader(ps.get(),nullptr,0);
     auto cb=constants.get();ctx->PSSetConstantBuffers(0,1,&cb);auto ss=sampler.get();ctx->PSSetSamplers(0,1,&ss);
-    ctx->PSSetShaderResources(0,1,&source);ctx->Draw(3,0);
+    ctx->PSSetShaderResources(0,1,&source);
+    if(mesh){UINT stride=sizeof(WarpVertex),offset=0;auto buffer=meshVertices.get();ctx->IASetVertexBuffers(0,1,&buffer,&stride,&offset);ctx->IASetIndexBuffer(meshIndices.get(),DXGI_FORMAT_R32_UINT,0);ctx->DrawIndexed(meshIndexCount,0,0);}
+    else ctx->Draw(3,0);
     ID3D11ShaderResourceView* empty=nullptr;ctx->PSSetShaderResources(0,1,&empty);
     check_hresult(swapchain->Present(0,0));
 }

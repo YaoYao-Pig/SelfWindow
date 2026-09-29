@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "geometry.h"
+#include "warp.h"
 
 namespace sw {
 struct Monitor {
@@ -57,6 +58,7 @@ class Renderer {
 public:
     Renderer(Graphics& g,HWND window,int w,int h);
     void draw(ID3D11ShaderResourceView* source,const Homography& transform,bool grid);
+    void draw(ID3D11ShaderResourceView* source,const WarpMapping& mapping,bool grid);
     Pixels snapshot();
 private:
     Graphics& graphics;
@@ -68,5 +70,11 @@ private:
     winrt::com_ptr<ID3D11PixelShader> ps;
     winrt::com_ptr<ID3D11Buffer> constants;
     winrt::com_ptr<ID3D11SamplerState> sampler;
+    winrt::com_ptr<ID3D11VertexShader> meshVs;
+    winrt::com_ptr<ID3D11InputLayout> meshLayout;
+    winrt::com_ptr<ID3D11Buffer> meshVertices,meshIndices;
+    std::uint64_t meshRevision=0;
+    UINT meshIndexCount=0;
+    void drawFrame(ID3D11ShaderResourceView* source,const Homography& transform,bool grid,bool mesh);
 };
 }

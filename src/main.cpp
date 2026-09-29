@@ -11,13 +11,17 @@
 #include <iomanip>
 #include <locale>
 #include <limits>
+#include "../tests/warp-tests.h"
 
 using namespace sw;
 static HINSTANCE appInstance;
 static HWND mainWindow;
 static HFONT font, titleFont, smallFont;
 static std::vector<Monitor> monitors;
-static std::vector<Quad> quads;
+static std::vector<WarpProfile> profiles;
+static std::vector<std::shared_ptr<WarpMapping>> mappings;
+static bool editMesh=false;
+static HWND calibrationWindow=nullptr,selectionInfo=nullptr;
 static int selected=0, selectedCorner=0;
 static HWND combo, toggleButton, gridCheck, statusLabel, cornerLabels[4];
 static std::wstring status=L"选择显示器，开启校正，再拖动四角。配置按屏幕和方向分别保存。";
@@ -31,7 +35,7 @@ static UINT uiDpi=96;
 static HANDLE watchdogProcess=nullptr;
 static bool timerResolution=false;
 static bool emergencyReady=false;
-static constexpr int ID_MONITOR=101,ID_TOGGLE=102,ID_GRID=103,ID_RESET=104,ID_SAVE=105,ID_REFRESH=106,ID_STOP=107,ID_IDENTIFY=108,ID_BACKGROUND=109;
+static constexpr int ID_MONITOR=101,ID_TOGGLE=102,ID_GRID=103,ID_RESET=104,ID_SAVE=105,ID_REFRESH=106,ID_STOP=107,ID_IDENTIFY=108,ID_BACKGROUND=109,ID_CALIBRATION=110;
 static constexpr int ID_TRAY_SETTINGS=401,ID_TRAY_QUIT=402;
 static constexpr UINT WM_TRAY=WM_APP+1,WM_RESTORE_PROFILES=WM_APP+2,WM_SHOW_SETTINGS=WM_APP+3;
 static NOTIFYICONDATAW trayIcon{};
@@ -42,10 +46,12 @@ static void RefreshTray();
 static void ShowSettings();
 static void HideSettings();
 static void ShowTrayMenu();
+static void OpenCalibration();
+static void SyncCalibration();
 
 struct Running {
     Monitor monitor;
-    Quad quad;
+    std::shared_ptr<WarpMapping> mapping;
     HWND window{};
     std::unique_ptr<Capture> capture;
     std::unique_ptr<Renderer> renderer;
@@ -73,18 +79,43 @@ static Quad LoadQuad(const Monitor& m) {
     for(auto& p:q) if(!(in>>p.x>>p.y)) return IdentityQuad();
     return ValidQuad(q)?q:IdentityQuad();
 }
+static WarpProfile LoadProfile(const Monitor& m){
+    WarpProfile p;p.corners=LoadQuad(m);p.heightCm=p.widthCm*m.height()/m.width();
+    wchar_t text[2048]{};auto key=ProfileKey(m);
+    GetPrivateProfileStringW(key.c_str(),L"view_v2",L"",text,2048,settingsFile.c_str());
+    if(text[0]){
+        std::wistringstream in(text);in.imbue(std::locale::classic());int mode{},axis{};
+        if(!(in>>mode>>p.widthCm>>p.heightCm>>p.distanceCm>>p.yaw>>p.pitch>>p.eyeX>>p.eyeY>>p.curvature>>axis)||mode<0||mode>2||axis<0||axis>1)
+            throw std::runtime_error("Invalid saved view profile");
+        p.mode=static_cast<WarpMode>(mode);p.horizontalAxis=axis!=0;
+    }
+    GetPrivateProfileStringW(key.c_str(),L"mesh_v2",L"",text,2048,settingsFile.c_str());
+    if(text[0]){std::wistringstream in(text);in.imbue(std::locale::classic());for(auto& point:p.offsets)if(!(in>>point.x>>point.y))throw std::runtime_error("Invalid saved mesh");}
+    ValidateProfile(p);return p;
+}
 static void SaveQuad(int index) {
     if(index<0||index>=static_cast<int>(monitors.size())) return;
     std::wostringstream out;out.imbue(std::locale::classic());out<<std::setprecision(10);
-    for(auto p:quads[index]) out<<p.x<<L' '<<p.y<<L' ';
+    if(GetPrivateProfileIntW(L"App",L"schema",1,settingsFile.c_str())<2&&GetFileAttributesW(settingsFile.c_str())!=INVALID_FILE_ATTRIBUTES){
+        std::wstring backup=settingsFile+L".v1-backup.ini";
+        if(!CopyFileW(settingsFile.c_str(),backup.c_str(),TRUE)&&GetLastError()!=ERROR_FILE_EXISTS)winrt::throw_last_error();
+    }
+    for(auto p:profiles[index].corners) out<<p.x<<L' '<<p.y<<L' ';
     if(!WritePrivateProfileStringW(ProfileKey(monitors[index]).c_str(),L"corners",out.str().c_str(),settingsFile.c_str())) winrt::throw_last_error();
+    const auto& p=profiles[index];std::wostringstream view,mesh;view.imbue(std::locale::classic());mesh.imbue(std::locale::classic());view<<std::setprecision(12);mesh<<std::setprecision(12);
+    view<<int(p.mode)<<L' '<<p.widthCm<<L' '<<p.heightCm<<L' '<<p.distanceCm<<L' '<<p.yaw<<L' '<<p.pitch<<L' '<<p.eyeX<<L' '<<p.eyeY<<L' '<<p.curvature<<L' '<<int(p.horizontalAxis);
+    for(auto d:p.offsets)mesh<<d.x<<L' '<<d.y<<L' ';
+    auto key=ProfileKey(monitors[index]);
+    winrt::check_bool(WritePrivateProfileStringW(key.c_str(),L"view_v2",view.str().c_str(),settingsFile.c_str()));
+    winrt::check_bool(WritePrivateProfileStringW(key.c_str(),L"mesh_v2",mesh.str().c_str(),settingsFile.c_str()));
+    winrt::check_bool(WritePrivateProfileStringW(L"App",L"schema",L"2",settingsFile.c_str()));
 }
 static bool LoadEnabled(int index) {
     wchar_t value[16]{};GetPrivateProfileStringW(ProfileKey(monitors[index]).c_str(),L"enabled",L"",value,16,settingsFile.c_str());
     if(value[0]) return wcscmp(value,L"1")==0;
     // Migrate a calibrated v1 display, which saved corners but no enabled flag.
     auto identity=IdentityQuad();
-    for(int i=0;i<4;++i) if(std::hypot(quads[index][i].x-identity[i].x,quads[index][i].y-identity[i].y)>1e-7) return true;
+    for(int i=0;i<4;++i) if(std::hypot(profiles[index].corners[i].x-identity[i].x,profiles[index].corners[i].y-identity[i].y)>1e-7) return true;
     return false;
 }
 static void SaveEnabled(int index,bool enabled) {
@@ -95,11 +126,20 @@ static void SetStatus(const std::wstring& text) {status=text;if(statusLabel) Set
 static void RefreshLabels() {
     if(mainWindow) SetTimer(mainWindow,1,running.empty()?250:16,nullptr);
     if(monitors.empty()) return;
-    const auto& q=quads[selected];const wchar_t* names[]={L"① 左上",L"② 右上",L"③ 右下",L"④ 左下"};
+    const auto& q=profiles[selected].corners;const wchar_t* names[]={L"① 左上",L"② 右上",L"③ 右下",L"④ 左下"};
+    bool cornersEditable=!editMesh&&profiles[selected].mode==WarpMode::Corners;
     for(int i=0;i<4;++i) {
         wchar_t text[100]{};swprintf_s(text,L"%s  X %.1f%%   Y %.1f%%",names[i],q[i].x*100,q[i].y*100);
         SetWindowTextW(cornerLabels[i],text);SendMessageW(cornerLabels[i],BM_SETCHECK,i==selectedCorner?BST_CHECKED:BST_UNCHECKED,0);
+        ShowWindow(cornerLabels[i],cornersEditable?SW_SHOW:SW_HIDE);
     }
+    EnableWindow(GetDlgItem(mainWindow,ID_RESET),cornersEditable);
+    const wchar_t* modeNames[]={L"四角透视",L"视点标定 · 平面",L"视点标定 · 圆柱"};
+    std::wstring info=modeNames[int(profiles[selected].mode)];
+    if(profiles[selected].mode!=WarpMode::Corners)info+=L"\r\n完整画面缩放 "+std::to_wstring(int(mappings[selected]->fit*100))+L"%";
+    if(editMesh)info+=L"\r\n网格点 "+std::to_wstring(selectedCorner+1)+L" / 16\r\n拖动圆点或用方向键微调。";
+    else if(!cornersEditable)info+=L"\r\n点击“曲面与视点设置”调节。";
+    SetWindowTextW(selectionInfo,info.c_str());ShowWindow(selectionInfo,cornersEditable?SW_HIDE:SW_SHOW);
     SetWindowTextW(toggleButton,FindRunning(monitors[selected].key)?L"停止此屏校正":L"开启此屏校正");
     InvalidateRect(mainWindow,&previewRect,FALSE);
     RefreshTray();
@@ -114,11 +154,23 @@ static void DisableAll() {
     StopAll();
     for(int i=0;i<static_cast<int>(monitors.size());++i) SaveEnabled(i,false);
 }
+static bool ApplyProfile(const WarpProfile& p){
+    try{
+        auto mapping=std::make_shared<WarpMapping>(p,monitors[selected].width(),monitors[selected].height());
+        profiles[selected]=p;mappings[selected]=mapping;
+        if(auto r=FindRunning(monitors[selected].key)){r->mapping=mapping;r->dirty=true;}
+        RefreshLabels();return true;
+    }catch(const std::exception&){SetStatus(L"未应用此次调整：范围超出屏幕或出现折叠。请减小角度、偏移或网格移动量。");return false;}
+}
 static void ApplyQuad(const Quad& q) {
     if(!ValidQuad(q)||monitors.empty()) return;
-    quads[selected]=q;
-    if(auto r=FindRunning(monitors[selected].key)) {r->quad=q;r->dirty=true;}
-    RefreshLabels();
+    auto profile=profiles[selected];profile.corners=q;ApplyProfile(profile);
+}
+static void MoveMeshPoint(Point delta){
+    auto p=profiles[selected];int x=selectedCorner%4,y=selectedCorner/4;
+    double weight=Bernstein(x/3.)[x]*Bernstein(y/3.)[y];
+    p.offsets[selectedCorner].x+=delta.x/weight;p.offsets[selectedCorner].y+=delta.y/weight;
+    ApplyProfile(p);
 }
 static void StartSelected() {
     if(monitors.empty()) return;
@@ -131,7 +183,7 @@ static void StartSelected() {
         RefreshLabels();SetStatus(L"已恢复此屏原画面。校准参数仍保留。");return;
     }
     if(!watchdogProcess||!emergencyReady) throw winrt::hresult_error(E_FAIL,L"恢复保护或紧急快捷键未就绪，无法开启校正。请释放 Ctrl+Alt+F12 后重新打开软件。");
-    auto r=std::make_unique<Running>();r->monitor=monitor;r->quad=quads[selected];
+    auto r=std::make_unique<Running>();r->monitor=monitor;r->mapping=mappings[selected];
     r->window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
         L"SelfWindowOutput",L"SelfWindow Output",WS_POPUP,monitor.bounds.left,monitor.bounds.top,monitor.width(),monitor.height(),nullptr,nullptr,appInstance,nullptr);
     if(!r->window) winrt::throw_last_error();
@@ -208,7 +260,7 @@ static void Tick() {
             if(GetTickCount64()-r->started>4000) throw winrt::hresult_error(E_FAIL,L"4 秒内没有收到桌面画面。请检查屏幕捕获权限或关闭冲突的显示工具。");
             continue;
         }
-        if(changed||r->dirty) {r->renderer->draw(r->capture->view.get(),FromQuad(r->quad),grid);r->dirty=false;}
+        if(changed||r->dirty) {r->renderer->draw(r->capture->view.get(),*r->mapping,grid);r->dirty=false;}
         if(!r->shown) {
             ShowWindow(r->window,SW_SHOWNOACTIVATE);r->shown=true;
             SetStatus(L"校正已开启。拖动预览四角可实时调整；关闭校准网格后即可操作桌面。");
@@ -222,7 +274,7 @@ static void Tick() {
     if(!GetCursorPos(&p)) {cursor->restore();return;}
     bool warped=false;Point mapped{};
     for(auto& r:running) if(r->shown&&PtInRect(&r->monitor.bounds,p)) {
-        auto uv=FromQuad(r->quad).map({double(p.x-r->monitor.bounds.left)/r->monitor.width(),double(p.y-r->monitor.bounds.top)/r->monitor.height()});
+        auto uv=r->mapping->map({double(p.x-r->monitor.bounds.left)/r->monitor.width(),double(p.y-r->monitor.bounds.top)/r->monitor.height()});
         mapped={r->monitor.bounds.left+uv.x*r->monitor.width(),r->monitor.bounds.top+uv.y*r->monitor.height()};warped=true;break;
     }
     cursor->update(warped,mapped);
@@ -230,16 +282,21 @@ static void Tick() {
 static void ReloadMonitors() {
     StopAll();refreshing=true;
     auto previous=monitors.empty()?L"":monitors[selected].key;
-    monitors=EnumerateMonitors();quads.clear();selected=0;
+    monitors=EnumerateMonitors();profiles.clear();mappings.clear();selected=0;selectedCorner=0;bool resetInvalid=false;
     SendMessageW(combo,CB_RESETCONTENT,0,0);
     for(int i=0;i<static_cast<int>(monitors.size());++i) {
-        auto& m=monitors[i];quads.push_back(LoadQuad(m));
+        auto& m=monitors[i];WarpProfile p;p.corners=LoadQuad(m);p.heightCm=p.widthCm*m.height()/m.width();
+        try{p=LoadProfile(m);mappings.push_back(std::make_shared<WarpMapping>(p,m.width(),m.height()));}
+        catch(...){p.mode=WarpMode::Corners;p.offsets={};p.widthCm=30;p.heightCm=30.*m.height()/m.width();p.distanceCm=60;p.eyeX=p.eyeY=p.pitch=0;p.yaw=30;p.curvature=100;
+            mappings.push_back(std::make_shared<WarpMapping>(p,m.width(),m.height()));resetInvalid=true;}
+        profiles.push_back(p);
         std::wstring name=m.device+L"   "+std::to_wstring(m.width())+L" × "+std::to_wstring(m.height())+(m.height()>m.width()?L"   竖屏":L"   横屏")+(m.primary?L"  · 主屏":L"");
         SendMessageW(combo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(name.c_str()));
         if(m.key==previous) selected=i;
     }
     if(previous.empty()&&!monitors.empty()) selected=static_cast<int>(monitors.size())-1;
-    SendMessageW(combo,CB_SETCURSEL,selected,0);refreshing=false;RefreshLabels();InvalidateRect(mainWindow,nullptr,TRUE);
+    SendMessageW(combo,CB_SETCURSEL,selected,0);refreshing=false;RefreshLabels();SyncCalibration();InvalidateRect(mainWindow,nullptr,TRUE);
+    if(resetInvalid)SetStatus(L"某个已保存的曲面参数无效，已回到该屏的四角模式；原配置文件仍保留。");
 }
 static HWND Control(const wchar_t* cls,const wchar_t* text,DWORD style,int id) {
     HWND h=CreateWindowExW(0,cls,text,WS_CHILD|WS_VISIBLE|style,0,0,10,10,mainWindow,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),appInstance,nullptr);
@@ -260,7 +317,8 @@ static void Layout() {
     move(ID_TOGGLE,24,143,148,36);move(ID_GRID,188,145,148,32);move(ID_RESET,350,143,94,36);move(ID_SAVE,454,143,94,36);move(ID_STOP,logicalW-174,143,150,36);
     int sideX=logicalW-286;
     for(int i=0;i<4;++i) move(201+i,sideX,254+i*45,262,36);
-    move(ID_BACKGROUND,sideX,568,262,36);
+    move(ID_CALIBRATION,sideX,568,262,36);move(ID_BACKGROUND,sideX,612,262,36);
+    move(302,sideX,254,262,175);
     int bottom=std::max(S(530),h-S(92));
     previewRect={S(24),S(210),S(sideX-24),bottom};
     MoveWindow(statusLabel,S(24),h-S(66),w-S(48),S(52),TRUE);
@@ -281,25 +339,27 @@ static void PaintPreview(HDC dc) {
     HBRUSH panel=CreateSolidBrush(RGB(234,239,244));FillRect(dc,&previewRect,panel);DeleteObject(panel);
     if(monitors.empty()) return;
     RECT r=ScreenRect();HBRUSH bg=CreateSolidBrush(RGB(12,19,28));FillRect(dc,&r,bg);DeleteObject(bg);
-    auto tr=FromQuad(quads[selected]);
+    const auto& tr=*mappings[selected];
     HPEN pen=CreatePen(PS_SOLID,1,RGB(73,109,127));auto oldPen=SelectObject(dc,pen);
-    auto line=[&](Point a,Point b){auto p=ToPreview(tr.map(a),r),q=ToPreview(tr.map(b),r);MoveToEx(dc,p.x,p.y,nullptr);LineTo(dc,q.x,q.y);};
+    auto line=[&](Point a,Point b){for(int i=0;i<=64;++i){double t=i/64.;auto p=ToPreview(tr.map({a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t}),r);if(i==0)MoveToEx(dc,p.x,p.y,nullptr);else LineTo(dc,p.x,p.y);}};
     for(int i=0;i<=10;++i) {line({i/10.,0},{i/10.,1});line({0,i/10.},{1,i/10.});}
     SelectObject(dc,oldPen);DeleteObject(pen);
     pen=CreatePen(PS_SOLID,S(2),RGB(60,209,165));oldPen=SelectObject(dc,pen);
-    for(int i=0;i<4;++i) {auto a=ToPreview(quads[selected][i],r),b=ToPreview(quads[selected][(i+1)%4],r);MoveToEx(dc,a.x,a.y,nullptr);LineTo(dc,b.x,b.y);}
+    auto edges=IdentityQuad();for(int i=0;i<4;++i)line(edges[i],edges[(i+1)%4]);
     SelectObject(dc,oldPen);DeleteObject(pen);
     const auto& m=monitors[selected];double radius=std::min(m.width(),m.height())*0.23;
     pen=CreatePen(PS_SOLID,S(2),RGB(66,189,226));oldPen=SelectObject(dc,pen);
     for(int i=0;i<=80;++i) {double a=i*6.283185307179586/80;auto p=ToPreview(tr.map({.5+cos(a)*radius/m.width(),.5+sin(a)*radius/m.height()}),r);if(i==0) MoveToEx(dc,p.x,p.y,nullptr);else LineTo(dc,p.x,p.y);}
     SelectObject(dc,oldPen);DeleteObject(pen);
     COLORREF colors[]={RGB(245,87,79),RGB(71,199,125),RGB(79,129,239),RGB(244,180,62)};
-    for(int i=0;i<4;++i) {
-        POINT p=ToPreview(quads[selected][i],r);int size=S(i==selectedCorner?10:8);
-        HBRUSH b=CreateSolidBrush(colors[i]);auto ob=SelectObject(dc,b);auto op=SelectObject(dc,GetStockObject(WHITE_PEN));Ellipse(dc,p.x-size,p.y-size,p.x+size+1,p.y+size+1);SelectObject(dc,ob);SelectObject(dc,op);DeleteObject(b);
+    int handles=editMesh?16:(profiles[selected].mode==WarpMode::Corners?4:0);
+    for(int i=0;i<handles;++i) {
+        Point uv=editMesh?Point{(i%4)/3.,(i/4)/3.}:edges[i];
+        POINT p=ToPreview(editMesh?tr.analytic(uv):profiles[selected].corners[i],r);int size=S(i==selectedCorner?8:6);
+        HBRUSH b=CreateSolidBrush(editMesh?RGB(67,154,214):colors[i]);auto ob=SelectObject(dc,b);auto op=SelectObject(dc,GetStockObject(WHITE_PEN));Ellipse(dc,p.x-size,p.y-size,p.x+size+1,p.y+size+1);SelectObject(dc,ob);SelectObject(dc,op);DeleteObject(b);
         Text(dc,p.x+S(13),p.y-S(10),std::to_wstring(i+1),RGB(80,103,120),smallFont);
     }
-    Text(dc,previewRect.left+S(14),previewRect.top+S(8),L"拖动彩色圆点 · 与屏幕实际方向一致",RGB(85,104,120),smallFont);
+    Text(dc,previewRect.left+S(14),previewRect.top+S(8),editMesh?L"局部曲面微调 · 拖动蓝色圆点":L"实际方向预览 · 曲面与视点可单独设置",RGB(85,104,120),smallFont);
     std::wstring label=std::to_wstring(m.width())+L" × "+std::to_wstring(m.height())+L"  /  "+std::to_wstring(m.rotation*90)+L"°";
     Text(dc,previewRect.left+S(14),previewRect.bottom-S(24),label,RGB(85,104,120),smallFont);
 }
@@ -310,7 +370,7 @@ static void PaintMain(HWND hwnd) {
     Text(mem,S(24),S(17),L"SelfWindow  屏幕透视校正",RGB(25,43,61),titleFont);
     Text(mem,S(26),S(59),L"横屏 / 竖屏独立校准，让侧面的画面更方正。",RGB(88,107,123),smallFont);
     PaintPreview(mem);int x=previewRect.right+S(24);
-    Text(mem,x,S(215),L"四角位置",RGB(25,43,61));
+    Text(mem,x,S(215),editMesh?L"局部网格":L"当前校准",RGB(25,43,61));
     Text(mem,x,S(448),L"选中圆点后，用方向键微调。",RGB(88,107,123),smallFont);
     Text(mem,x,S(473),L"每次 1 像素；Shift 加速到 10 像素。",RGB(88,107,123),smallFont);
     Text(mem,x,S(508),L"Ctrl + Alt + F10   开关此屏",RGB(51,99,124),smallFont);
@@ -324,6 +384,7 @@ static void Identify() {
         SetWindowDisplayAffinity(h,WDA_EXCLUDEFROMCAPTURE);ShowWindow(h,SW_SHOWNOACTIVATE);SetTimer(h,1,2200,nullptr);
     }
 }
+#include "view_controls.h"
 static void HandleFailure(const std::wstring& message) {
     StopAll();SetStatus(L"已恢复全部屏幕。"+message);ShowSettings();
 }
@@ -339,9 +400,11 @@ static LRESULT CALLBACK MainProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
             gridCheck=Control(WC_BUTTONW,L"显示校准网格",BS_AUTOCHECKBOX|WS_TABSTOP,ID_GRID);
             Control(WC_BUTTONW,L"重置四角",BS_PUSHBUTTON|WS_TABSTOP,ID_RESET);Control(WC_BUTTONW,L"保存参数",BS_PUSHBUTTON|WS_TABSTOP,ID_SAVE);
             Control(WC_BUTTONW,L"恢复全部屏幕",BS_PUSHBUTTON|WS_TABSTOP,ID_STOP);
+            Control(WC_BUTTONW,L"曲面与视点设置…",BS_PUSHBUTTON|WS_TABSTOP,ID_CALIBRATION);
             Control(WC_BUTTONW,L"隐藏到托盘，继续校正",BS_PUSHBUTTON|WS_TABSTOP,ID_BACKGROUND);
             for(int i=0;i<4;++i) cornerLabels[i]=Control(WC_BUTTONW,L"",BS_RADIOBUTTON|WS_TABSTOP,201+i);
             statusLabel=Control(WC_STATICW,status.c_str(),SS_LEFT,301);
+            selectionInfo=Control(WC_STATICW,L"",SS_LEFT,302);
             ReloadMonitors();Layout();SetTimer(h,1,16,nullptr);
             emergencyReady=RegisterHotKey(h,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_F12)!=FALSE;
             if(!emergencyReady) throw winrt::hresult_error(E_FAIL,L"Ctrl+Alt+F12 被其他程序占用。请释放快捷键后重启。");
@@ -349,7 +412,7 @@ static LRESULT CALLBACK MainProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
             return 0;
         }
         case WM_SIZE: if(wp==SIZE_MINIMIZED) HideSettings();else Layout();return 0;
-        case WM_GETMINMAXINFO: {auto p=reinterpret_cast<MINMAXINFO*>(lp);p->ptMinTrackSize={S(910),S(750)};return 0;}
+        case WM_GETMINMAXINFO: {auto p=reinterpret_cast<MINMAXINFO*>(lp);p->ptMinTrackSize={S(910),S(800)};return 0;}
         case WM_DPICHANGED: {uiDpi=HIWORD(wp);SetFonts();auto r=reinterpret_cast<RECT*>(lp);SetWindowPos(h,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);Layout();return 0;}
         case WM_PAINT: PaintMain(h);return 0;
         case WM_ERASEBKGND:return 1;
@@ -366,7 +429,7 @@ static LRESULT CALLBACK MainProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_HOTKEY:if(wp==1) {DisableAll();SetStatus(L"已通过快捷键恢复全部屏幕。");}else if(wp==2) StartSelected();return 0;
         case WM_COMMAND: {
             int id=LOWORD(wp);
-            if(id==ID_MONITOR&&HIWORD(wp)==CBN_SELCHANGE&&!refreshing) {selected=static_cast<int>(SendMessageW(combo,CB_GETCURSEL,0,0));RefreshLabels();InvalidateRect(h,nullptr,TRUE);}
+            if(id==ID_MONITOR&&HIWORD(wp)==CBN_SELCHANGE&&!refreshing) {selected=static_cast<int>(SendMessageW(combo,CB_GETCURSEL,0,0));selectedCorner=0;RefreshLabels();SyncCalibration();InvalidateRect(h,nullptr,TRUE);}
             else if(id==ID_TOGGLE) StartSelected();
             else if(id==ID_GRID) {grid=SendMessageW(gridCheck,BM_GETCHECK,0,0)==BST_CHECKED;for(auto& r:running) r->dirty=true;}
             else if(id==ID_RESET) {ApplyQuad(IdentityQuad());SaveQuad(selected);SetStatus(L"此屏四角已重置。");}
@@ -375,6 +438,7 @@ static LRESULT CALLBACK MainProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
             else if(id==ID_IDENTIFY) Identify();
             else if(id==ID_STOP) {DisableAll();SetStatus(L"已恢复全部屏幕。");}
             else if(id==ID_BACKGROUND) HideSettings();
+            else if(id==ID_CALIBRATION) OpenCalibration();
             else if(id==ID_TRAY_SETTINGS) ShowSettings();
             else if(id==ID_TRAY_QUIT) DestroyWindow(h);
             else if(id>=201&&id<=204) {selectedCorner=id-201;RefreshLabels();SetFocus(h);}
@@ -383,18 +447,24 @@ static LRESULT CALLBACK MainProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_LBUTTONDOWN: {
             if(monitors.empty()) break;
             POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};RECT r=ScreenRect();int nearest=-1;double distance=S(22)*S(22);
-            for(int i=0;i<4;++i) {auto c=ToPreview(quads[selected][i],r);double d=double(c.x-p.x)*(c.x-p.x)+double(c.y-p.y)*(c.y-p.y);if(d<distance) {distance=d;nearest=i;}}
+            int handles=editMesh?16:(profiles[selected].mode==WarpMode::Corners?4:0);
+            for(int i=0;i<handles;++i) {Point uv{(i%4)/3.,(i/4)/3.};auto c=ToPreview(editMesh?mappings[selected]->analytic(uv):profiles[selected].corners[i],r);double d=double(c.x-p.x)*(c.x-p.x)+double(c.y-p.y)*(c.y-p.y);if(d<distance) {distance=d;nearest=i;}}
             if(nearest>=0) {selectedCorner=nearest;dragging=true;SetCapture(h);SetFocus(h);RefreshLabels();}return 0;
         }
         case WM_MOUSEMOVE:if(dragging&&!monitors.empty()) {
-            RECT r=ScreenRect();Quad q=quads[selected];q[selectedCorner]={std::clamp(double(GET_X_LPARAM(lp)-r.left)/(r.right-r.left),0.,1.),std::clamp(double(GET_Y_LPARAM(lp)-r.top)/(r.bottom-r.top),0.,1.)};ApplyQuad(q);
+            RECT r=ScreenRect();Point desired{std::clamp(double(GET_X_LPARAM(lp)-r.left)/(r.right-r.left),0.,1.),std::clamp(double(GET_Y_LPARAM(lp)-r.top)/(r.bottom-r.top),0.,1.)};
+            if(editMesh){Point uv{(selectedCorner%4)/3.,(selectedCorner/4)/3.};auto current=mappings[selected]->analytic(uv);MoveMeshPoint({desired.x-current.x,desired.y-current.y});}
+            else{Quad q=profiles[selected].corners;q[selectedCorner]=desired;ApplyQuad(q);}
         }return 0;
         case WM_LBUTTONUP:if(dragging) {dragging=false;ReleaseCapture();SaveQuad(selected);}return 0;
         case WM_CAPTURECHANGED:if(dragging) {dragging=false;SaveQuad(selected);}return 0;
         case WM_KEYDOWN: {
             if(wp==VK_ESCAPE) {DisableAll();SetStatus(L"已恢复全部屏幕。");return 0;}
             if(!monitors.empty()&&(wp==VK_LEFT||wp==VK_RIGHT||wp==VK_UP||wp==VK_DOWN)) {
-                Quad q=quads[selected];double step=(GetKeyState(VK_SHIFT)&0x8000)?10:1;
+                if(!editMesh&&profiles[selected].mode!=WarpMode::Corners)break;
+                double step=(GetKeyState(VK_SHIFT)&0x8000)?10:1;
+                if(editMesh){Point d{};if(wp==VK_LEFT)d.x=-step/monitors[selected].width();if(wp==VK_RIGHT)d.x=step/monitors[selected].width();if(wp==VK_UP)d.y=-step/monitors[selected].height();if(wp==VK_DOWN)d.y=step/monitors[selected].height();MoveMeshPoint(d);SaveQuad(selected);return 0;}
+                Quad q=profiles[selected].corners;
                 if(wp==VK_LEFT) q[selectedCorner].x-=step/monitors[selected].width();
                 if(wp==VK_RIGHT) q[selectedCorner].x+=step/monitors[selected].width();
                 if(wp==VK_UP) q[selectedCorner].y-=step/monitors[selected].height();
@@ -461,6 +531,12 @@ static int BackgroundTest(const std::wstring& outputDir) {
         ULONGLONG start=GetTickCount64();while(GetTickCount64()-start<500) {Pump();Tick();Sleep(16);}
         Require(running.size()==1&&running[0]->shown,"Saved enabled display did not start");
         log<<"PASS: saved display enabled state restored; actual capture/output running while hidden.\n";
+        auto savedProfile=profiles[selected];auto curved=savedProfile;curved.mode=WarpMode::Cylinder;curved.horizontalAxis=true;curved.yaw=32;curved.curvature=72;curved.eyeX=-5;curved.offsets[5]={.005,-.003};
+        Require(ApplyProfile(curved),"Could not apply cylinder profile");SaveQuad(selected);auto reloaded=LoadProfile(monitors[selected]);
+        Require(reloaded.mode==WarpMode::Cylinder&&reloaded.horizontalAxis&&std::abs(reloaded.curvature-72)<1e-10&&std::abs(reloaded.offsets[5].x-.005)<1e-10,"Curve/mesh profile did not round-trip");
+        Require(ApplyProfile(savedProfile),"Could not switch back to legacy profile");SaveQuad(selected);
+        Require(profiles[selected].corners[0].x==savedProfile.corners[0].x,"Switching modes damaged old corners");
+        log<<"PASS: cylinder, viewing parameters and Bezier offsets persist; original corners preserved.\n";
         grid=true;HideSettings();Require(!grid,"Calibration grid remained active in background");
         SendMessageW(mainWindow,WM_CLOSE,0,0);Require(IsWindow(mainWindow)&&!IsWindowVisible(mainWindow),"Close did not hide to tray");
         Require(running.size()==1,"Close stopped active correction");
@@ -498,7 +574,8 @@ static int SelfTest(const std::wstring& outputDir) {
         Quad crossed={{{0,0},{1,1},{1,0},{0,1}}};Require(!ValidQuad(crossed),"Crossed quad accepted");
         Quad flat={{{0,0},{1,0},{1,0},{0,0}}};Require(!ValidQuad(flat),"Degenerate quad accepted");
         auto invalid=IdentityQuad();invalid[0].x=std::numeric_limits<double>::quiet_NaN();Require(!ValidQuad(invalid),"NaN accepted");
-        log<<"PASS: "<<checks+3<<" assertions; projective mapping, inverse hit alignment, portrait/landscape, negative origins, invalid quads.\n";return 0;
+        log<<"PASS: "<<checks+3<<" assertions; projective mapping, inverse hit alignment, portrait/landscape, negative origins, invalid quads.\n";
+        RunWarpTests(log);return 0;
     }catch(const std::exception& e) {log<<"FAIL: "<<e.what()<<"\n";return 1;}
 }
 static int Diagnostics(const std::wstring& outputDir) {
@@ -567,6 +644,25 @@ static int IntegrationTest(const std::wstring& outputDir) {
                 auto behind=g.readTexture(capture.texture.get());for(int i=0;i<4;++i) checkColor(behind,centers[i],i);
                 renderer.draw(capture.view.get(),homography,true);renderer.draw(capture.view.get(),homography,true);
                 SaveBitmap(renderer.snapshot(),outputDir+L"\\grid-"+std::to_wstring(m.width())+L"x"+std::to_wstring(m.height())+L".bmp");
+                std::vector<unsigned char> ramp(256*256*4);
+                for(int y=0;y<256;++y)for(int x=0;x<256;++x){size_t offset=size_t(y*256+x)*4;ramp[offset]=0;ramp[offset+1]=static_cast<unsigned char>(y);ramp[offset+2]=static_cast<unsigned char>(x);ramp[offset+3]=255;}
+                D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=256;desc.MipLevels=desc.ArraySize=1;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;desc.Usage=D3D11_USAGE_IMMUTABLE;
+                D3D11_SUBRESOURCE_DATA data{};data.pSysMem=ramp.data();data.SysMemPitch=256*4;
+                winrt::com_ptr<ID3D11Texture2D> rampTexture;winrt::com_ptr<ID3D11ShaderResourceView> rampView;
+                winrt::check_hresult(g.device->CreateTexture2D(&desc,&data,rampTexture.put()));winrt::check_hresult(g.device->CreateShaderResourceView(rampTexture.get(),nullptr,rampView.put()));
+                for(int scenario=0;scenario<4;++scenario){
+                    WarpProfile p;p.mode=scenario==0?WarpMode::ViewPlane:WarpMode::Cylinder;p.widthCm=30;p.heightCm=30.*m.height()/m.width();p.yaw=32;p.pitch=7;p.eyeX=-5;p.eyeY=4;p.horizontalAxis=scenario>=2;
+                    if(scenario==3){p.curvature=-85;p.offsets[5]={.008,-.005};p.offsets[10]={-.007,.005};}
+                    WarpMapping mapping(p,m.width(),m.height());
+                    renderer.draw(rampView.get(),mapping,false);renderer.draw(rampView.get(),mapping,false);auto pixels=renderer.snapshot();
+                    for(int iy=0;iy<7;++iy)for(int ix=0;ix<7;++ix){
+                        Point uv{.12+ix*.12,.12+iy*.12};auto out=mapping.map(uv);int x=int(out.x*m.width()),y=int(out.y*m.height());size_t offset=(size_t(y)*pixels.width+x)*4;
+                        Require(std::abs(int(pixels.bgra[offset+2])-(uv.x*256-.5))<3&&std::abs(int(pixels.bgra[offset+1])-(uv.y*256-.5))<3,"GPU sampling and software cursor mapping disagree");
+                    }
+                    for(int i=0;i<2;++i)renderer.draw(capture.view.get(),mapping,true);
+                    if(scenario==2)SaveBitmap(renderer.snapshot(),outputDir+L"\\cylinder-"+std::to_wstring(m.width())+L"x"+std::to_wstring(m.height())+L".bmp");
+                    log<<winrt::to_string(m.device)<<" scenario="<<scenario<<" PASS: GPU ramp/cursor alignment, subdivisions="<<mapping.divisions<<"\n";
+                }
             }
             DestroyWindow(overlay);overlay=nullptr;capture.stop();DestroyWindow(pattern);pattern=nullptr;
             log<<winrt::to_string(m.device)<<" "<<m.width()<<"x"<<m.height()<<" rotation="<<m.rotation*90<<" PASS: oriented capture, GPU homography, corner colors, black borders, overlay excluded without recursion.\n";
@@ -587,6 +683,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,PWSTR,int) {
     bool openSettings=argc>=2&&std::wstring(argv[1])==L"--settings";
     bool quitRequested=argc>=2&&std::wstring(argv[1])==L"--quit";
     bool backgroundTest=argc>=2&&std::wstring(argv[1])==L"--background-test";
+    bool uiTest=argc>=2&&std::wstring(argv[1])==L"--ui-test";if(uiTest)openSettings=true;
     std::wstring testDirectory=argc>=3?argv[2]:L"test-output";
     LocalFree(argv);
     if(quitRequested) {if(auto h=FindWindowW(L"SelfWindowMain",nullptr)) PostMessageW(h,WM_COMMAND,ID_TRAY_QUIT,0);return 0;}
@@ -594,9 +691,9 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,PWSTR,int) {
     if(GetLastError()==ERROR_ALREADY_EXISTS) {if(!backgroundTest) {if(auto h=FindWindowW(L"SelfWindowMain",nullptr)) PostMessageW(h,WM_SHOW_SETTINGS,0,0);}if(single) CloseHandle(single);return backgroundTest?2:0;}
     int result=0;
     try {
-        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES};InitCommonControlsEx(&controls);
+        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&controls);
         InitializeSettings();
-        if(backgroundTest) {CreateDirectoryW(testDirectory.c_str(),nullptr);settingsFile=testDirectory+L"\\background-test-"+std::to_wstring(GetCurrentProcessId())+L".ini";}
+        if(backgroundTest||uiTest) {CreateDirectoryW(testDirectory.c_str(),nullptr);settingsFile=testDirectory+L"\\isolated-test-"+std::to_wstring(GetCurrentProcessId())+L".ini";}
         graphics=std::make_unique<Graphics>();cursor=std::make_unique<Cursor>();appIcon=CreateAppIcon();RegisterClasses();
         taskbarCreatedMessage=RegisterWindowMessageW(L"TaskbarCreated");
         MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromPoint({0,0},MONITOR_DEFAULTTOPRIMARY),&mi);
